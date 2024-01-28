@@ -1,0 +1,755 @@
+---
+title: "Statistical observable analysis for FX correlation matrices"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r load_packages, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE)
+options(dplyr.summarise.inform=FALSE)
+library(rmarkdown)
+library(knitr)
+library(readr)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(corrplot)
+library(DT)
+library(kableExtra)
+library(lubridate)
+library(anytime)
+library(RcppQuantuccia)
+library(broom)
+library(viridis)
+set.seed(10)
+
+# In case of an issue with the kableExtra package, install the 'devtools' package i.e. install.packages('devtools') and then run devtools::install_github("kupietz/kableExtra")
+```
+
+
+```{r define_functions, include=FALSE}
+year_mon <- function(year,month){
+  year_str <- as.character(year)
+  mon_str <- as.character(month)
+  if (length(mon_str)==1){
+    return(paste0(year_str,"-0",mon_str))
+  } else {
+    return(paste0(year_str,"-",mon_str))
+  }
+}
+
+get_christmas_and_new_years <- function(start_date,end_date){
+  all_days <- seq(start_date,end_date,by=1)
+  hol_dates <- c()
+  for (current_date_idx in seq_along(all_days)) {
+    current_date <- all_days[current_date_idx]
+    if (lubridate::month(current_date) == 12 & (lubridate::day(current_date) ==24 | lubridate::day(current_date) ==25 | lubridate::day(current_date) ==26 | lubridate::day(current_date) ==31)){
+      hol_dates <- append(hol_dates,current_date)
+    }
+      if (lubridate::month(current_date) == 1 & (lubridate::day(current_date) ==1 | lubridate::day(current_date) ==2)){
+      hol_dates <- append(hol_dates,current_date)
+    }
+  }
+  return(hol_dates)
+}
+
+construct_corr_mat <- function(input_df, dim_mat){
+  result_mat <- matrix(rep(NA,dim_mat*dim_mat),nrow=dim_mat, ncol=dim_mat)
+  for (i in 1:dim_mat) {
+    for (j in i:dim_mat) {
+      filt <- input_df %>% filter(Var1==i & Var2==j)
+      if (i==j){
+        if (nrow(filt)>0){
+           result_mat[i,i] <-  0
+        }
+      } else {
+        if (nrow(filt)>0){
+          result_mat[i,j] <- filt$correlation_coeff
+          result_mat[j,i] <- filt$correlation_coeff
+        }
+      }
+    }
+  }
+  return(result_mat)
+}
+
+string_match_found <- function(input_str_vec, all_strings){
+  result <- FALSE
+  for (str in input_str_vec) {
+    result <- result | grepl(str, all_strings,fixed = TRUE,ignore.case = TRUE)
+  }
+  return(result)
+}
+
+options(mc.cores=12)
+sum_apply <- function(indice_mat, FUN,para = FALSE){
+  indice_mat <- as.matrix(indice_mat)
+  if (para==FALSE){
+      return(sum(apply(indice_mat,MARGIN = 1, FUN=FUN)))
+  } else {
+      sz_mat <- nrow(indice_mat)
+      return(sum(unlist(parallel::mclapply(1:sz_mat,FUN=function(x){FUN(indice_mat[x,])}))))
+  }
+}
+
+glance_prop <- function(proportion_test, type="approx", row_total){
+  if (type=="approx"){
+    return(glance(proportion_test))
+  }
+  if (type=="exact"){
+    proportion_test_glance <- glance(proportion_test)
+    cnt1 <- row_total*proportion_test_glance$estimate1
+    cnt1c <- row_total-cnt1
+    cnt2 <- row_total*proportion_test_glance$estimate2
+    cnt2c <- row_total-cnt2
+    return(data.frame(glance(fisher.test(rbind(c(cnt1,cnt1c),c(cnt2,cnt2c)),alternative = "greater")),estimate1=cnt1/row_total,estimate2=cnt2/row_total))
+  }
+}
+
+mah <- function(x, cx = NULL) {
+  if(is.null(cx)) cx <- cov(x)
+  out <- lapply(1:nrow(x), function(i) {
+    mahalanobis(x = x, 
+                center = x[i, ],
+                cov = cx)
+  })
+  return(as.dist(do.call("rbind", out)))
+}
+```
+
+
+```{r specify_currency_pairs, include=FALSE}
+all_currency_pairs <- c("AUD/JPY","AUD/NZD", "AUD/USD", "CAD/JPY", "CHF/JPY", "EUR/CHF",
+                        "EUR/GBP","EUR/JPY","EUR/PLN","EUR/USD", "GBP/JPY", "GBP/USD",
+                        "NZD/USD", "USD/CAD", "USD/CHF", "USD/JPY","USD/MXN",
+                        "USD/TRY","USD/ZAR")
+all_currency_pairs <- sort(all_currency_pairs)
+num_currencies_analyzed <- length(all_currency_pairs)
+```
+
+
+```{r specify_parameters, include=FALSE}
+output_type <- "html"
+
+# Specify timescale for analysis, choices are "1 minute", "5 minutes", "10 minutes", "15 minutes"
+time_scale <- "5 minutes"
+
+# Specify where to use the in-sample time-range for the analysis (as per article) or the out-of-sample time range. Options are "in-sample" and "out-of-sample"
+time_range_type <- "in-sample"
+
+if (time_scale == "1 minute"){
+  correlation_table_db <- 'fx_correlations_1mins'
+  time_scale_mins_filt <- 1
+}
+if (time_scale == "5 minutes"){
+  correlation_table_db <- 'fx_correlations'
+  time_scale_mins_filt <- 5
+}
+if (time_scale == "10 minutes"){
+  correlation_table_db <- 'fx_correlations_10mins'
+  time_scale_mins_filt <- 10
+}
+if (time_scale == "15 minutes"){
+  correlation_table_db <- 'fx_correlations_15mins'
+  time_scale_mins_filt <- 15
+}
+
+if (time_range_type == "out-of-sample"){
+  start_dt <- "2022-03-01"
+  end_dt <- "2023-04-01"
+} else {
+  start_dt <- "2020-04-01"
+  end_dt <- "2022-01-31"
+}
+
+# Load all correlations - based on the realised correlation estimator - and filter for the chosen timescale
+fx_correlations <- arrow::read_parquet("./data/raw_correlations.parquet")
+fx_correlations <- fx_correlations %>% filter(time_scale_mins==time_scale_mins_filt) %>% select(-time_scale_mins)
+
+# Define dates to exclude from the analysis
+setCalendar("UnitedStates")
+all_hols_us <- getHolidays(as.Date("2020-04-01"),as.Date("2023-07-31"))
+exclude_dates <- sort(unique(c(all_hols_us,get_christmas_and_new_years(as.Date("2020-04-01"),as.Date("2023-07-31")))))
+feb_2022 <- seq(as.Date("2022-02-01"),as.Date("2022-02-28"),by=1)
+exclude_dates <- sort(c(exclude_dates,feb_2022))
+
+
+fx_correlations <- fx_correlations %>% mutate(dt=as.Date(dt))
+fx_correlations <- fx_correlations %>% filter(!(dt %in% exclude_dates ))
+fx_correlations <- fx_correlations %>% filter(dt >= as.Date(start_dt) & dt <=as.Date(end_dt))
+fx_correlations <- fx_correlations %>% rename(Var1 = currency_pair_1, Var2 = currency_pair_2, correlation_coeff=correlation_coeff)
+fx_correlations <- fx_correlations %>% mutate(Var1 = match(Var1,all_currency_pairs),
+                                                                      Var2 = match(Var2,all_currency_pairs))
+result_all_df <- fx_correlations %>% filter(Var2 >= Var1)
+levels <- result_all_df %>% select(Var1,Var2) %>% arrange(Var1,Var2) %>% summarise(element = paste0(Var1,"-",Var2))
+levels <- unique(levels$element)
+result_all_df <- result_all_df %>% mutate(element=factor(paste0(Var1,"-",Var2),levels=levels), correlation_coeff = correlation_coeff)
+result_all_df_off_diag <- result_all_df %>%
+  filter(Var1 != Var2) %>% ungroup()
+```
+
+```{r calculate_correlation_mats, include = FALSE}
+# The code below allows the use of cached correlations for speed. If one desires recalculating the correlation matrices from stored correlations, set calculate_corr to TRUE
+calculate_corr <- FALSE
+filen_corr <- paste0("./data/corr_mat_",correlation_table_db,"_",start_dt,"_",end_dt,".rds") 
+if (calculate_corr == TRUE){
+  corr_per_day <- result_all_df  %>% group_by(dt) %>% filter(n() == num_currencies_analyzed*(num_currencies_analyzed+1)/2) %>% arrange(dt) %>%  group_map(~construct_corr_mat(input_df = .x, dim_mat =  num_currencies_analyzed))
+  saveRDS(corr_per_day,file=filen_corr)
+} else {
+  corr_per_day <- readRDS(file=filen_corr)
+}
+dt_list_df <- result_all_df %>% group_by(dt) %>% filter(n() == num_currencies_analyzed*(num_currencies_analyzed+1)/2)  %>% select(dt) %>% arrange(dt) 
+dt_list <- sort(unique(dt_list_df$dt))
+ensemble_size <- length(corr_per_day)
+```
+
+```{r extract_example_correlations, include = FALSE}
+eur_usd_usd_jpy <- sapply(corr_per_day,function(x){x[10,16]})
+eur_usd_gbp_usd <- sapply(corr_per_day,function(x){x[10,12]})
+plot_corr_df <- data.frame(Date=as.Date(dt_list),correlation=eur_usd_usd_jpy,currency_pairs="EUR/USD - USD/JPY")
+plot_corr_df <- rbind(plot_corr_df,data.frame(Date=as.Date(dt_list),correlation=eur_usd_gbp_usd,currency_pairs="EUR/USD - GBP/USD"))
+```
+
+# Correlation Elements
+
+## Example correlations
+
+Reproduces figure 1 in the article with date range set to 2020-04-01 to 2022-01-31 (time_range_type = "in-sample") and time_scale = "5 minutes".
+
+```{r plot_example_correlations}
+ggplot(plot_corr_df,aes(x=Date,correlation,color=currency_pairs))+geom_line()+xlab("Date")+ylab("Correlation Coefficient")+ scale_color_brewer(palette = "Paired")
+```
+
+```{r calculate_observables, include = FALSE}
+# The code below allows the use of cached observable values for speed. If one desires recalculating the observables from correlation matrices, set generate_matrices to TRUE
+dimension_observables <- 35
+filen_mat <- paste0("./data/obs_mat_store_",correlation_table_db,"_",start_dt,"_",end_dt,".rds") 
+generate_matrices <- FALSE
+if (generate_matrices == TRUE){
+  M <- matrix(nrow=dimension_observables, ncol=ensemble_size)
+  for (widx in seq_len(ensemble_size)) {
+    W <- corr_per_day[[widx]]
+    # Linear terms - 1 term
+    M[1, widx] <- sum(W)  # \ sum_{i,j} W_{ij})
+    # Quadratic terms - 3 terms
+    W1 = W ^ 2
+    M[2, widx] = sum(W1)  # \sum_{i,j} W_{ij}^2
+    W_sqr = W %*% W
+    M[3, widx] = sum(W_sqr)  # \sum_{i,j,k} W_{ij} W_{jk}
+    M[4, widx] = (sum(W)) ^ 2  # \sum_{i,j,k,l} W_{ij} W_{kl}
+    # Cubic Terms - 8 terms
+    W3 <- W^3
+    # Two vertex
+    M[5, widx] <-  sum(W3)  # \sum_{i,j} W_{ij}^3   
+    # Three Vertex
+    M[6, widx] <- sum(W1 %*% W)  # \sum_{i,j,k} W_{ij}^2 W_{jk} 
+    M[7, widx] <- sum(diag(W_sqr %*% W))  # \sum_{i,j,k,l} W_{ij} W_{ik} W_{jk} = \sum_{i,j,k,l} [W^{2}]_{kj} W_{jk}=\sum_{i,j,k,l} W_{ij} W_{jk} W_{ki}
+    # Four Vertex
+    M[8, widx] <- sum(W) * sum(W1)  # \sum_{i,j,k,l} W_{ij}^2 W_{kl} 
+    W_cubed <- W %*% W %*% W
+    M[9, widx] <- sum(W_cubed)  # \sum_{i,j,k,l} W_{ij} W_{jk} W_{kl} 
+    indice_mat <- expand.grid(i = 1:nrow(W), j = 1:nrow(W), k = 1:nrow(W), l = 1:nrow(W))
+    M[10, widx] <- sum_apply(indice_mat, FUN=function(x){W[x[1],x[2]] * W[x[1],x[3]] *W[x[1],x[4]] },para = T) # \sum_{i,j,k,l} W_{ij} W_{ik} W_{il}
+    # Five Vertex
+    M[11, widx] <-  sum(W_sqr) * sum(W) # \sum_{i,j,k,l,m} W_{ij} W_{jk} W_{lm}
+    # Six Vertex
+    M[12, widx] <-  (sum(W))^3 # \sum_{i,j,k,l,m,n} W_{ij} W_{kl} W_{mn}
+    # Quartic terms - 23 terms
+    W4 <- W^4    
+    M[13, widx] <-  sum(W4)  # \sum_{i,j} W_{ij}^4  
+    M[14, widx] <-  sum(W1 %*% W1)  # \sum_{i,j,k} W_{ij}^2 W_{jk}^2  
+    M[15, widx] <-  sum(W %*% W3)  # \sum_{i,j,k} M_{ij} M_{jk}^3   
+    M[16, widx] <-  sum(diag(W %*% W1 %*% W))  # \sum_{i,j,k} M_{ij} M_{ik} M_{jk}^2   
+    M[17, widx] <- sum_apply(indice_mat, FUN=function(x){W[x[1],x[2]] * W[x[2],x[3]] *(W[x[2],x[4]])^2 },para = T) # \sum_{i,j,k,l} M_{ij} M_{kj} M_{lj}^2
+    M[18, widx] <-  sum(W) * sum(W3)  # \sum_{i,j,k,l} M_{ij} M_{kl}^3
+    M[19, widx] <-  sum(W %*% W1 %*% W)  # \sum_{i,j,k,l} M_{ij} M_{jk}^2 M_{kl} 
+    M[20, widx] <-  sum(W_sqr %*% W1)  #\sum_{i,j,k,l} M_{ij} M_{jk} M_{kl}^2
+    M[21, widx] <- sum_apply(indice_mat, FUN=function(x){W[x[1],x[2]] * W[x[2],x[3]] *W[x[1],x[3]] *W[x[3],x[4]] },para = T) # \sum_{i,j,k,l} M_{ij} M_{jk} M_{ik} M_{kl} 
+    M[22, widx] <-  sum(W1) * sum(W1)  # \sum_{i,j,k,l} M_{ij}^2 M_{kl}^2
+    W_power_4 <- W_sqr %*% W_sqr
+    M[23, widx] <- sum(diag(W_power_4))  # \sum_{i,j,k,l} M_{ij} M_{jk} M_{kl} M_{li}
+    indice_mat_5 <- expand.grid(i = 1:nrow(W), j = 1:nrow(W), k = 1:nrow(W), l = 1:nrow(W), m=1:nrow(W))
+    M[24, widx] <- sum_apply(indice_mat_5, FUN=function(x){W[x[1],x[3]] * W[x[2],x[3]] *W[x[4],x[3]]*W[x[5],x[3]] },para = T) #  \sum_{i,j,k,l, m} M_{ik} M_{jk} M_{lk} M_{mk}
+    M[25, widx] <- sum_apply(indice_mat_5, FUN=function(x){W[x[1],x[4]] * W[x[2],x[3]] *W[x[4],x[3]]*W[x[5],x[3]] },para = T) #  \sum_{i,j,k,l, m} M_{il} M_{jk} M_{lk} M_{mk}
+    M[26, widx] <-  sum(W) * sum(diag(W_cubed))  # \sum_{i,j,k,l, m} M_{ij} M_{kl} M_{lm} M_{mk} 
+    M[27, widx] <-  sum(W1) * sum(W_sqr)  # \sum_{i,j,k,l, m} M_{ij}^2 M_{kl} M_{lm} 
+    M[28, widx] <-  sum(W) * sum(W %*% W1)  # \sum_{i,j,k,l, m} M_{ij} M_{kl} M_{lm}^2
+    M[29, widx] <-  sum(W_power_4)  # \sum_{i,j,k,l,m} M_{ij} M_{jk} M_{kl} M_{lm} 
+    M[30, widx] <- sum(W) * sum_apply(indice_mat, FUN=function(x){W[x[1],x[2]] * W[x[1],x[3]] *W[x[1],x[4]]},para = T) # \sum_{i,j,k,l,m,n} M_{ij} M_{kl} M_{km} M_{kn} 1=k, 2=l, 3=m, 4=n
+    M[31, widx] <-  (sum(W_sqr)) ^ 2  # \sum_{i,j,k,l,m,n} M_{ij} M_{jk} M_{lm} M_{ln}
+    M[32, widx] <-  sum(W1) * (sum(W)) ^ 2  # \sum_{i,j,k,l,m,n} M_{ij}^2 M_{kl} M_{mn}
+    M[33, widx] <-  sum(W) * sum(W_cubed)  # \sum_{i,j,k,l,m,n} M_{ij} M_{kl} M_{lm} M_{mn}
+    M[34, widx] <-  sum(W_sqr) * (sum(W))^2  #\sum_{i,j,k,l,m,n,o} M_{ij} M_{jk} M_{lm} M_{no} 
+    M[35, widx] <-  (sum(W))^4  # \sum_{i,j,k,l,m,n,o,p} M_{ij} M_{kl} M_{mn} M_{op} 
+  saveRDS(M,file=filen_mat)
+  }
+}
+```
+
+```{r select_observables, include = FALSE}
+# Select the observables to use for the subsequent analysis. The below correspond to the 12 least well fit observables as discussed in the article.
+M <- readRDS(file=filen_mat)
+observable_mat <- M
+observable_mat <- t(observable_mat)
+select_obs <- c(7, 26,23,21,9,16,29,33,13,20,14,25)
+all_observable_mat <- observable_mat[,5:35]
+observable_mat <- observable_mat[,select_obs]
+num_observables <- ncol(observable_mat)
+colnames(observable_mat) <-  paste0("O_",seq_len(num_observables))
+num_observables_all <- ncol(all_observable_mat)
+colnames(all_observable_mat) <-  paste0("O_",seq_len(num_observables_all))
+observable_df <- as.data.frame(observable_mat) 
+observable_df_with_dt <- observable_df %>% mutate(dt=dt_list)
+```
+
+# Statistical Summary of Observables
+
+## Individual Distributions
+
+```{r prepare_observables_for_hist, include = FALSE}
+observable_df_ln_all <- as.data.frame(all_observable_mat)  %>% pivot_longer(cols = everything(),names_to = "observable", values_to = "value")
+observable_df_ln_all$observable <- factor(observable_df_ln_all$observable,levels = paste0("O_",seq_len(num_observables_all)))
+observable_df_ln_all <- observable_df_ln_all %>% mutate(obs_order = case_when(
+  observable %in% c(factor( paste0("O_",1:7),levels = paste0("O_",1:7))) ~ 3,
+  observable %in% c(factor( paste0("O_",8:dimension_observables),levels = paste0("O_",8:dimension_observables))) ~ 4,
+  TRUE ~ NaN
+))
+observable_df_ln_all <- observable_df_ln_all %>% group_by(observable) %>%  mutate(value=scale(value))
+```
+
+Reproduces figure 2 in the article with date range set to 2020-04-01 to 2022-01-31 (time_range_type = "in-sample") and time_scale = "5 minutes".
+
+```{r plot_histogram_of_observables}
+p1 <- ggplot(observable_df_ln_all) + geom_histogram(aes(x = value),bins=30) + 
+   facet_wrap(~observable, scales = "free", ncol=6)  + xlab("Value") + ylab("Count") 
+p1
+```
+
+## Correlation of Observables
+
+Reproduces figure 3 in the article with date range set to 2020-04-01 to 2022-01-31 (time_range_type = "in-sample") and time_scale = "5 minutes".
+
+```{r plot_correlations}
+observable_df_for_cor <- as.data.frame(all_observable_mat) 
+observable_df_cor <- cor(observable_df_for_cor)
+corrplot(observable_df_cor, method = 'ellipse', type = 'upper',col=COL1("Blues"),tl.col = 'black')
+```
+
+# Anomaly Detection
+
+```{r prepare_features}
+observable_df_with_dt <- observable_df_with_dt %>% mutate(ym = year_mon(lubridate::year(dt),lubridate::month(dt)))
+correl_features <- result_all_df %>% group_by(dt) %>% filter(n() == num_currencies_analyzed*(num_currencies_analyzed+1)/2) %>% filter(Var1 != Var2) %>% filter(!(dt %in% exclude_dates)) %>% group_map(~.x$correlation_coeff)
+correl_features <- do.call(rbind, correl_features)
+```
+
+```{r load_and_filter_cal}
+search_strings <-c("ECB Press Conference", "BoE MPC", "FOMC Press Conference", "BoJ Press Conference", "PBoC Interest Rate Decision", "Nonfarm Payrolls", "European Council Meeting", "EU Leaders Special Summit", "ECB Special Strategy Meeting","Consumer Price Index ex Food & Energy")
+special_dates <- readr::read_csv('./data/fxstreet_calendar_Nov2023.csv', show_col_types = FALSE)
+special_dates <- special_dates %>% mutate(dt=as.character(lubridate::date(anytime(Start)))) %>% filter(Currency %in% c("USD", "EUR", "GBP", "CNY","JPY")) %>% filter(string_match_found(search_strings,Name)) %>% select(dt,description=Name)
+```
+
+
+## Observable Vector Length Euclidean Metric
+
+```{r observable_euclidean_calc}
+enriched_df <- observable_df_with_dt
+obs_mat_current <- as.matrix(enriched_df[,1:(ncol(enriched_df)-2)])
+# Calculate vector lengths
+res <- rep(NA,nrow(obs_mat_current))
+for (i in seq_len(nrow(obs_mat_current))) {
+  vars <- apply(obs_mat_current[-i,],2,FUN = sd)
+  means <- colMeans(obs_mat_current[-i,])
+  scale_i <- (obs_mat_current[i,] - means)/vars
+  res[i] <- sum((scale_i)^2)
+}
+vec_lengths_from_origin_proc <- res
+enriched_df <- enriched_df %>% mutate(vec_lengths_from_origin=vec_lengths_from_origin_proc) %>% mutate(metric_features="Observables: Euclidean")
+
+enriched_df_euclidean_obs <- enriched_df
+output_df <- enriched_df %>% arrange(-vec_lengths_from_origin) %>% select(dt,vec_lengths_from_origin) %>% mutate(dt=as.character(dt)) %>% left_join(special_dates,by="dt")
+output_proc <- output_df %>% mutate(is_event = ifelse(!is.na(description),1,0)) %>% arrange(-vec_lengths_from_origin) %>% mutate(number_of_events = cumsum(is_event)) %>% group_by(dt) %>% summarise(vec_lengths_from_origin = first(vec_lengths_from_origin),is_event= ifelse(sum(is_event)>=1,1,0))
+
+output_proc_top_10 <- as.numeric(output_proc %>% slice_max(vec_lengths_from_origin,n=10) %>% summarise(sum(is_event)))
+output_proc_bottom_10 <- as.numeric(output_proc %>% slice_min(vec_lengths_from_origin,n=10) %>% summarise(sum(is_event)))
+
+output_proc_top_25 <- as.numeric(output_proc %>% slice_max(vec_lengths_from_origin,n=25) %>% summarise(sum(is_event)))
+output_proc_bottom_25 <- as.numeric(output_proc %>% slice_min(vec_lengths_from_origin,n=25) %>% summarise(sum(is_event)))
+
+output_proc_top_50 <- as.numeric(output_proc %>% slice_max(vec_lengths_from_origin,n=50) %>% summarise(sum(is_event)))
+output_proc_bottom_50 <- as.numeric(output_proc %>% slice_min(vec_lengths_from_origin,n=50) %>% summarise(sum(is_event)))
+
+output_proc_top_100 <- as.numeric(output_proc %>% slice_max(vec_lengths_from_origin,n=100) %>% summarise(sum(is_event)))
+output_proc_bottom_100 <- as.numeric(output_proc %>% slice_min(vec_lengths_from_origin,n=100) %>% summarise(sum(is_event)))
+
+output_df <- output_df %>% slice_max(vec_lengths_from_origin,n=10) %>% mutate(vec_lengths_from_origin=round(vec_lengths_from_origin,2)) %>% 
+  rename(date=dt, vector_length_from_center=vec_lengths_from_origin)
+```
+
+```{r observable_euclidean_hyp_test}
+tst1 <- prop.test(x = c(output_proc_top_10,output_proc_bottom_10), n=c(10,10),alternative='greater')
+tst2 <- prop.test(x = c(output_proc_top_25,output_proc_bottom_25), n=c(25,25),alternative='greater')
+tst3 <- prop.test(x = c(output_proc_top_50,output_proc_bottom_50), n=c(50,50),alternative='greater')
+tst4 <- prop.test(x = c(output_proc_top_100,output_proc_bottom_100), n=c(100,100),alternative='greater')
+
+binom_prop_euclidean <- rbind(glance_prop(tst1,type="exact",row_total = 10) %>% rename(proportion_top = estimate1, proportion_bottom=estimate2) %>% mutate(subset_size=10,features = "Observables", metric= "Euclidean" ) %>% relocate(subset_size,.before =proportion_top) %>% relocate(features,.before = subset_size)
+                               %>% relocate(metric,.before = features),
+      glance_prop(tst2,type="exact",row_total = 25) %>% rename(proportion_top = estimate1, proportion_bottom=estimate2) %>% mutate(subset_size=25,features = "Observables", metric= "Euclidean" ) %>% relocate(subset_size,.before =proportion_top) %>% relocate(features,.before = subset_size)
+                               %>% relocate(metric,.before = features),
+       glance_prop(tst3,type="exact",row_total = 50) %>% rename(proportion_top = estimate1, proportion_bottom=estimate2) %>% mutate(subset_size=50,features = "Observables", metric= "Euclidean" ) %>% relocate(subset_size,.before =proportion_top) %>% relocate(features,.before = subset_size)
+                               %>% relocate(metric,.before = features),
+       glance_prop(tst4,type="exact",row_total = 100) %>% rename(proportion_top = estimate1, proportion_bottom=estimate2) %>% mutate(subset_size=100,features = "Observables", metric= "Euclidean" ) %>% relocate(subset_size,.before =proportion_top) %>% relocate(features,.before = subset_size)
+                               %>% relocate(metric,.before = features)) 
+
+```
+
+```{r display_top_10_length_obs_euc}
+kable(output_df, output_type, booktabs = TRUE, longtable = TRUE, caption = "Top 10 Deviation vector lengths") %>%
+  kable_styling(latex_options = c("hold_position", "repeat_header"))
+```
+
+## Observable Vector Length Mahalanobis Metric
+
+```{r observable_mahalanobis_calc}
+enriched_df <- observable_df_with_dt 
+obs_mat_current <- as.matrix(enriched_df[,1:(ncol(enriched_df)-2)])
+res <- rep(NA,nrow(obs_mat_current))
+# Calculate vector lengths
+for (i in seq_len(nrow(obs_mat_current))) {
+  cov_mat <- cov(obs_mat_current[-i,])
+  mean_vec <- colMeans(obs_mat_current[-i,])
+  res[i] <-  mahalanobis(obs_mat_current[i,],center = mean_vec,cov = cov_mat)
+}
+vec_lengths_from_origin_proc <- res
+enriched_df <- enriched_df %>% mutate(vec_lengths_from_origin=vec_lengths_from_origin_proc)%>% mutate(metric_features="Observables: Mahalanobis")
+enriched_df_mahalanobis_obs <- enriched_df
+
+output_df <- enriched_df %>% arrange(-vec_lengths_from_origin) %>% select(dt,vec_lengths_from_origin) %>% mutate(dt=as.character(dt)) %>% left_join(special_dates,by="dt")
+
+output_proc <- output_df %>% mutate(is_event = ifelse(!is.na(description),1,0)) %>% arrange(-vec_lengths_from_origin) %>% mutate(number_of_events = cumsum(is_event)) %>% group_by(dt) %>% summarise(vec_lengths_from_origin = first(vec_lengths_from_origin),is_event= ifelse(sum(is_event)>=1,1,0))
+
+output_proc_top_10 <- as.numeric(output_proc %>% slice_max(vec_lengths_from_origin,n=10) %>% summarise(sum(is_event)))
+output_proc_bottom_10 <- as.numeric(output_proc %>% slice_min(vec_lengths_from_origin,n=10) %>% summarise(sum(is_event)))
+
+output_proc_top_25 <- as.numeric(output_proc %>% slice_max(vec_lengths_from_origin,n=25) %>% summarise(sum(is_event)))
+output_proc_bottom_25 <- as.numeric(output_proc %>% slice_min(vec_lengths_from_origin,n=25) %>% summarise(sum(is_event)))
+
+output_proc_top_50 <- as.numeric(output_proc %>% slice_max(vec_lengths_from_origin,n=50) %>% summarise(sum(is_event)))
+output_proc_bottom_50 <- as.numeric(output_proc %>% slice_min(vec_lengths_from_origin,n=50) %>% summarise(sum(is_event)))
+
+output_proc_top_100 <- as.numeric(output_proc %>% slice_max(vec_lengths_from_origin,n=100) %>% summarise(sum(is_event)))
+output_proc_bottom_100 <- as.numeric(output_proc %>% slice_min(vec_lengths_from_origin,n=100) %>% summarise(sum(is_event)))
+
+output_df <- output_df %>% slice_max(vec_lengths_from_origin,n=10) %>% mutate(vec_lengths_from_origin=round(vec_lengths_from_origin,2)) %>% 
+  rename(date=dt, vector_length_from_center=vec_lengths_from_origin)
+```
+
+```{r observable_mahalanobis_hyp_test}
+tst1 <- prop.test(x = c(output_proc_top_10,output_proc_bottom_10), n=c(10,10),alternative='greater')
+tst2 <- prop.test(x = c(output_proc_top_25,output_proc_bottom_25), n=c(25,25),alternative='greater')
+tst3 <- prop.test(x = c(output_proc_top_50,output_proc_bottom_50), n=c(50,50),alternative='greater')
+tst4 <- prop.test(x = c(output_proc_top_100,output_proc_bottom_100), n=c(100,100),alternative='greater')
+
+binom_prop_mahalanobis <- rbind(glance_prop(tst1,type="exact",row_total = 10) %>% rename(proportion_top = estimate1, proportion_bottom=estimate2) %>% mutate(subset_size=10,features = "Observables", metric= "Mahalanobis" ) %>% relocate(subset_size,.before =proportion_top) %>% relocate(features,.before = subset_size)
+                               %>% relocate(metric,.before = features),
+      glance_prop(tst2,type="exact",row_total = 25) %>% rename(proportion_top = estimate1, proportion_bottom=estimate2) %>% mutate(subset_size=25,features = "Observables", metric= "Mahalanobis" ) %>% relocate(subset_size,.before =proportion_top) %>% relocate(features,.before = subset_size)
+                               %>% relocate(metric,.before = features),
+      glance_prop(tst3,type="exact",row_total = 50) %>% rename(proportion_top = estimate1, proportion_bottom=estimate2) %>% mutate(subset_size=50,features = "Observables", metric= "Mahalanobis" ) %>% relocate(subset_size,.before =proportion_top) %>% relocate(features,.before = subset_size)
+                               %>% relocate(metric,.before = features),
+      glance_prop(tst4,type="exact",row_total = 100) %>% rename(proportion_top = estimate1, proportion_bottom=estimate2) %>% mutate(subset_size=100,features = "Observables", metric= "Mahalanobis" ) %>% relocate(subset_size,.before =proportion_top) %>% relocate(features,.before = subset_size)
+                               %>% relocate(metric,.before = features)) 
+```
+
+```{r display_top_10_length_obs_mah}
+kable(output_df, output_type, booktabs = TRUE, longtable = TRUE, caption = "Top 10 Deviation vector lengths") %>%
+  kable_styling(latex_options = c("hold_position", "repeat_header"))
+```
+
+## Raw Correlation Vector Length Euclidean Metric
+
+```{r raw_correl_euclidean_calc}
+obs_mat_current <- correl_features
+res <- rep(NA,nrow(obs_mat_current))
+for (i in seq_len(nrow(obs_mat_current))) {
+  vars <- apply(obs_mat_current[-i,],2,FUN = sd)
+  means <- colMeans(obs_mat_current[-i,])
+  scale_i <- (obs_mat_current[i,] - means)/vars
+  res[i] <- sum((scale_i)^2)
+}
+vec_lengths_from_origin_proc <- res
+
+enriched_df <- enriched_df %>% mutate(vec_lengths_from_origin=vec_lengths_from_origin_proc)%>% mutate(metric_features="Raw Correlations: Euclidean")
+enriched_df_euclidean_raw_correl <- enriched_df
+
+output_df <- enriched_df %>% arrange(-vec_lengths_from_origin) %>% select(dt,vec_lengths_from_origin) %>% mutate(dt=as.character(dt)) %>% left_join(special_dates,by="dt")
+
+output_proc <- output_df %>% mutate(is_event = ifelse(!is.na(description),1,0)) %>% arrange(-vec_lengths_from_origin) %>% mutate(number_of_events = cumsum(is_event)) %>% group_by(dt) %>% summarise(vec_lengths_from_origin = first(vec_lengths_from_origin),is_event= ifelse(sum(is_event)>=1,1,0))
+
+output_proc_top_10 <- as.numeric(output_proc %>% slice_max(vec_lengths_from_origin,n=10) %>% summarise(sum(is_event)))
+output_proc_bottom_10 <- as.numeric(output_proc %>% slice_min(vec_lengths_from_origin,n=10) %>% summarise(sum(is_event)))
+
+output_proc_top_25 <- as.numeric(output_proc %>% slice_max(vec_lengths_from_origin,n=25) %>% summarise(sum(is_event)))
+output_proc_bottom_25 <- as.numeric(output_proc %>% slice_min(vec_lengths_from_origin,n=25) %>% summarise(sum(is_event)))
+
+output_proc_top_50 <- as.numeric(output_proc %>% slice_max(vec_lengths_from_origin,n=50) %>% summarise(sum(is_event)))
+output_proc_bottom_50 <- as.numeric(output_proc %>% slice_min(vec_lengths_from_origin,n=50) %>% summarise(sum(is_event)))
+
+output_proc_top_100 <- as.numeric(output_proc %>% slice_max(vec_lengths_from_origin,n=100) %>% summarise(sum(is_event)))
+output_proc_bottom_100 <- as.numeric(output_proc %>% slice_min(vec_lengths_from_origin,n=100) %>% summarise(sum(is_event)))
+
+output_df <- output_df %>% slice_max(vec_lengths_from_origin,n=10) %>% mutate(vec_lengths_from_origin=round(vec_lengths_from_origin,2)) %>% 
+  rename(date=dt, vector_length_from_center=vec_lengths_from_origin)
+```
+
+```{r raw_correl_euclidean_hyp_test}
+tst1 <- prop.test(x = c(output_proc_top_10,output_proc_bottom_10), n=c(10,10),alternative='greater')
+tst2 <- prop.test(x = c(output_proc_top_25,output_proc_bottom_25), n=c(25,25),alternative='greater')
+tst3 <- prop.test(x = c(output_proc_top_50,output_proc_bottom_50), n=c(50,50),alternative='greater')
+tst4 <- prop.test(x = c(output_proc_top_100,output_proc_bottom_100), n=c(100,100),alternative='greater')
+
+binom_prop_std_euclid_raw <- rbind(glance_prop(tst1,type="exact",row_total = 10) %>% rename(proportion_top = estimate1, proportion_bottom=estimate2) %>% mutate(subset_size=10,features = "Raw Correlations", metric= "Euclidean" ) %>% relocate(subset_size,.before =proportion_top) %>% relocate(features,.before = subset_size)
+                               %>% relocate(metric,.before = features),
+      glance_prop(tst2,type="exact",row_total = 25) %>% rename(proportion_top = estimate1, proportion_bottom=estimate2) %>% mutate(subset_size=25,features = "Raw Correlations", metric= "Euclidean" ) %>% relocate(subset_size,.before =proportion_top) %>% relocate(features,.before = subset_size)
+                               %>% relocate(metric,.before = features),
+      glance_prop(tst3,type="exact",row_total = 50) %>% rename(proportion_top = estimate1, proportion_bottom=estimate2) %>% mutate(subset_size=50,features = "Raw Correlations", metric= "Euclidean" ) %>% relocate(subset_size,.before =proportion_top) %>% relocate(features,.before = subset_size)
+                               %>% relocate(metric,.before = features),
+      glance_prop(tst4,type="exact",row_total = 100) %>% rename(proportion_top = estimate1, proportion_bottom=estimate2) %>% mutate(subset_size=100,features = "Raw Correlations", metric= "Euclidean" ) %>% relocate(subset_size,.before =proportion_top) %>% relocate(features,.before = subset_size)
+                               %>% relocate(metric,.before = features))  
+```
+
+```{r display_top_10_length_correl_euc}
+kable(output_df, output_type, booktabs = TRUE, longtable = TRUE, caption = "Top 10 Deviation vector lengths") %>%
+  kable_styling(latex_options = c("hold_position", "repeat_header"))
+```
+
+
+## Raw Correlation Vector Length Mahalanobis Metric
+
+```{r raw_correl_mahalanobis_calc}
+obs_mat_current <- correl_features
+res <- rep(NA,nrow(obs_mat_current))
+for (i in seq_len(nrow(obs_mat_current))) {
+  cov_mat <- cov(obs_mat_current[-i,])
+  mean_vec <- colMeans(obs_mat_current[-i,])
+  res[i] <-  mahalanobis(obs_mat_current[i,],center = mean_vec,cov = cov_mat)
+}
+vec_lengths_from_origin_proc <- res
+
+enriched_df <- enriched_df %>% mutate(vec_lengths_from_origin=vec_lengths_from_origin_proc)%>% mutate(metric_features="Raw Correlations: Mahalanobis")
+enriched_df_mahalanobis_raw_correl <- enriched_df
+
+output_df <- enriched_df %>% arrange(-vec_lengths_from_origin) %>% select(dt,vec_lengths_from_origin) %>% mutate(dt=as.character(dt)) %>% left_join(special_dates,by="dt")
+
+output_proc <- output_df %>% mutate(is_event = ifelse(!is.na(description),1,0)) %>% arrange(-vec_lengths_from_origin) %>% mutate(number_of_events = cumsum(is_event)) %>% group_by(dt) %>% summarise(vec_lengths_from_origin = first(vec_lengths_from_origin),is_event= ifelse(sum(is_event)>=1,1,0))
+
+output_proc_top_10 <- as.numeric(output_proc %>% slice_max(vec_lengths_from_origin,n=10) %>% summarise(sum(is_event)))
+output_proc_bottom_10 <- as.numeric(output_proc %>% slice_min(vec_lengths_from_origin,n=10) %>% summarise(sum(is_event)))
+
+output_proc_top_25 <- as.numeric(output_proc %>% slice_max(vec_lengths_from_origin,n=25) %>% summarise(sum(is_event)))
+output_proc_bottom_25 <- as.numeric(output_proc %>% slice_min(vec_lengths_from_origin,n=25) %>% summarise(sum(is_event)))
+
+output_proc_top_50 <- as.numeric(output_proc %>% slice_max(vec_lengths_from_origin,n=50) %>% summarise(sum(is_event)))
+output_proc_bottom_50 <- as.numeric(output_proc %>% slice_min(vec_lengths_from_origin,n=50) %>% summarise(sum(is_event)))
+
+output_proc_top_100 <- as.numeric(output_proc %>% slice_max(vec_lengths_from_origin,n=100) %>% summarise(sum(is_event)))
+output_proc_bottom_100 <- as.numeric(output_proc %>% slice_min(vec_lengths_from_origin,n=100) %>% summarise(sum(is_event)))
+
+output_df <- output_df %>% slice_max(vec_lengths_from_origin,n=10) %>% mutate(vec_lengths_from_origin=round(vec_lengths_from_origin,2)) %>% 
+  rename(date=dt, vector_length_from_center=vec_lengths_from_origin)
+```
+
+```{r raw_correl_mahalanobis_hyp_test}
+tst1 <- prop.test(x = c(output_proc_top_10,output_proc_bottom_10), n=c(10,10),alternative='greater')
+tst2 <- prop.test(x = c(output_proc_top_25,output_proc_bottom_25), n=c(25,25),alternative='greater')
+tst3 <- prop.test(x = c(output_proc_top_50,output_proc_bottom_50), n=c(50,50),alternative='greater')
+tst4 <- prop.test(x = c(output_proc_top_100,output_proc_bottom_100), n=c(100,100),alternative='greater')
+
+binom_prop_mahalanobis_raw <- rbind(glance_prop(tst1,type="exact",row_total = 10) %>% rename(proportion_top = estimate1, proportion_bottom=estimate2) %>% mutate(subset_size=10,features = "Raw Correlations", metric= "Mahalanobis" ) %>% relocate(subset_size,.before =proportion_top) %>% relocate(features,.before = subset_size)
+                               %>% relocate(metric,.before = features),
+      glance_prop(tst2,type="exact",row_total = 25) %>% rename(proportion_top = estimate1, proportion_bottom=estimate2) %>% mutate(subset_size=25,features = "Raw Correlations", metric= "Mahalanobis" ) %>% relocate(subset_size,.before =proportion_top) %>% relocate(features,.before = subset_size)
+                               %>% relocate(metric,.before = features),
+      glance_prop(tst3,type="exact",row_total = 50) %>% rename(proportion_top = estimate1, proportion_bottom=estimate2) %>% mutate(subset_size=50,features = "Raw Correlations", metric= "Mahalanobis" ) %>% relocate(subset_size,.before =proportion_top) %>% relocate(features,.before = subset_size)
+                               %>% relocate(metric,.before = features),
+      glance_prop(tst4,type="exact",row_total = 100) %>% rename(proportion_top = estimate1, proportion_bottom=estimate2) %>% mutate(subset_size=100,features = "Raw Correlations", metric= "Mahalanobis" ) %>% relocate(subset_size,.before =proportion_top) %>% relocate(features,.before = subset_size)
+                               %>% relocate(metric,.before = features))  
+```
+
+```{r display_top_10_length_correl_mah}
+kable(output_df, output_type, booktabs = TRUE, longtable = TRUE, caption = "Top 10 Deviation vector lengths") %>%
+  kable_styling(latex_options = c("hold_position", "repeat_header"))
+```
+
+## Overall Analysis
+
+Reproduces figure 4 in the article with date range set to 2020-04-01 to 2022-01-31 (time_range_type = "in-sample") and time_scale = "5 minutes".
+
+```{r plot_anomaly_scores}
+all_enriched_df <- rbind(enriched_df_euclidean_obs,
+                         enriched_df_mahalanobis_obs,
+                         enriched_df_euclidean_raw_correl,
+                         enriched_df_mahalanobis_raw_correl)
+
+
+p2 <- ggplot(all_enriched_df, mapping=aes(x=dt, y=vec_lengths_from_origin)) + geom_line() + 
+   facet_wrap(~metric_features, scales = "free", ncol=1)  + xlab("Timestamp") + ylab("Distance From Origin") 
+p2
+```
+
+
+```{r prepare_anomaly_results}
+all_binom_results <- rbind(binom_prop_euclidean,
+                           binom_prop_mahalanobis,
+                           binom_prop_std_euclid_raw,
+                           binom_prop_mahalanobis_raw) %>% select(metric,features,subset_size, proportion_top,proportion_bottom, p_value=p.value )%>% arrange(features,metric) 
+```
+
+Reproduces anomaly detection tables in the article i.e. table 6, 7, 11, 12, 13, 14, 15, 16 depending on the date range and sampling time scale selected.
+
+```{r tabulate_anomaly_results}
+all_binom_results <- all_binom_results %>% filter(subset_size>10)%>% mutate(odds_ratio=(proportion_top/(1-proportion_top)/((proportion_bottom/(1-proportion_bottom))))) %>% mutate(p_value=p_value*1e2)
+
+kable(all_binom_results %>% filter(subset_size <=100), output_type, longtable = TRUE, caption = "Anomaly Detection Results",digits=2)
+```
+
+# Visual Similarity
+
+
+```{r}
+permutation_orderings <- lapply(corr_per_day,FUN=function(x){1:19})
+enriched_df <- observable_df_with_dt %>% mutate(across(.cols = -c(dt,ym),function(x){(x-mean(x))/sd(x)} )) 
+obs_mat_current <- as.matrix(enriched_df[,1:(ncol(enriched_df)-2)])
+distm <- mah(obs_mat_current)
+distm <- as.matrix(distm)
+all_row_idx <- rep(NA, nrow(distm)^2)
+all_col_idx <- rep(NA, nrow(distm)^2)
+all_dists <- rep(NA, nrow(distm)^2)
+count <- 0
+for (row_idx in seq_len(nrow(distm))) {
+  for (column_idx in seq_len(nrow(distm))){
+    count <- count +1
+    all_row_idx[count] <- row_idx
+    all_col_idx[count] <- column_idx
+    all_dists[count] <- distm[row_idx,column_idx]
+  }
+}
+pair_dist_df <- data.frame(row_idx=all_row_idx,col_idx = all_col_idx, dist=all_dists)
+pair_dist_df <- pair_dist_df %>%  filter(row_idx < col_idx) %>% mutate(row_date = dt_list[row_idx], col_date = dt_list[col_idx]) 
+pair_dist_df <- pair_dist_df %>% mutate(pair_idx=1:nrow(pair_dist_df)) %>% arrange(dist)
+closest_dates <- pair_dist_df %>% slice_min(order_by = dist, n=10)
+furthest_dates <- pair_dist_df %>% slice_max(order_by = dist, n=10)
+```
+
+
+```{r tabulate_closest_days}
+kable(closest_dates %>% select(Distance=dist, first_date = row_date, second_date=col_date), output_type, booktabs = TRUE, longtable = TRUE, caption = "Top 10 Closest dates", digits=1) %>%
+  kable_styling(latex_options = c("hold_position", "repeat_header"))
+```
+
+
+```{r tabulate_furthest_days}
+kable(furthest_dates %>% select(Distance=dist, first_date = row_date, second_date=col_date), output_type, booktabs = TRUE, longtable = TRUE, caption = "Top 10 Furthest dates") %>%
+  kable_styling(latex_options = c("hold_position", "repeat_header"))
+```
+
+```{r process_closest_days}
+# closest dates
+row_dt_idx <- match(closest_dates$row_date,dt_list)
+col_dt_idx <- match(closest_dates$col_date,dt_list)
+permutated_correl <- lapply(1:nrow(closest_dates),FUN=function(x){
+  correlation_coeff_rows = as.vector(corr_per_day[[row_dt_idx[x]]][permutation_orderings[[row_dt_idx[x]]], permutation_orderings[[row_dt_idx[x]]]])
+  correlation_coeff_cols= as.vector(corr_per_day[[col_dt_idx[x]]][permutation_orderings[[col_dt_idx[x]]], permutation_orderings[[col_dt_idx[x]]]])
+  df_row <- data.frame(correlation_coeff = correlation_coeff_rows,dt = dt_list[row_dt_idx[x]], type="row",id=((x-1)*2+1))
+  df_col <- data.frame(correlation_coeff = correlation_coeff_cols, dt = dt_list[col_dt_idx[x]],type="col",id=((x-1)*2+2))
+   return(rbind(df_row,df_col))
+  })
+permutated_correl <- as.data.frame(do.call("rbind", permutated_correl))
+matrix_indices <- expand.grid(Y=seq_len(19), X=seq_len(19))
+coords <- as.data.frame(sapply(matrix_indices,rep,times=nrow(closest_dates)))
+permutated_correl <- cbind(permutated_correl,coords)
+
+all_dts <- c(t(closest_dates[,c(4,5)]))
+dt_labeller <- function(variable,value){
+  return(all_dts[value])
+}
+```
+
+Reproduces figure 5 in the article with date range set to 2020-04-01 to 2022-01-31 (time_range_type = "in-sample") and time_scale = "5 minutes".
+
+```{r plot_closest_days}
+ggplot(permutated_correl,mapping = aes(x=X,y=Y, fill = correlation_coeff))+geom_tile() + facet_wrap(~id, scales = "free",ncol=2,labeller=dt_labeller) + scale_fill_viridis() +
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()
+        )+xlab("")+ylab("")
+```
+
+Reproduces figure 6 in the article with date range set to 2020-04-01 to 2022-01-31 (time_range_type = "in-sample") and time_scale = "5 minutes".
+
+```{r process_furthest_days}
+# furthest dates
+row_dt_idx <- match(furthest_dates$row_date,dt_list)
+col_dt_idx <- match(furthest_dates$col_date,dt_list)
+permutated_correl <- lapply(1:nrow(closest_dates),FUN=function(x){
+  correlation_coeff_rows = as.vector(corr_per_day[[row_dt_idx[x]]][permutation_orderings[[row_dt_idx[x]]], permutation_orderings[[row_dt_idx[x]]]])
+  correlation_coeff_cols= as.vector(corr_per_day[[col_dt_idx[x]]][permutation_orderings[[col_dt_idx[x]]], permutation_orderings[[col_dt_idx[x]]]])
+  df_row <- data.frame(correlation_coeff = correlation_coeff_rows,dt = dt_list[row_dt_idx[x]], type="row",id=((x-1)*2+1))
+  df_col <- data.frame(correlation_coeff = correlation_coeff_cols, dt = dt_list[col_dt_idx[x]],type="col",id=((x-1)*2+2))
+   return(rbind(df_row,df_col))
+  })
+permutated_correl <- as.data.frame(do.call("rbind", permutated_correl))
+matrix_indices <- expand.grid(Y=seq_len(19), X=seq_len(19))
+coords <- as.data.frame(sapply(matrix_indices,rep,times=nrow(closest_dates)))
+permutated_correl <- cbind(permutated_correl,coords)
+
+all_dts <- c(t(furthest_dates[,c(4,5)]))
+dt_labeller <- function(variable,value){
+  return(all_dts[value])
+}
+```
+
+
+```{r plot_furthest_days}
+ggplot(permutated_correl,mapping = aes(x=X,y=Y, fill = correlation_coeff))+geom_tile() + facet_wrap(~id, scales = "free",ncol=2,labeller=dt_labeller) + scale_fill_viridis() +
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank() 
+        )+xlab("")+ylab("")
+```
+
+Calculates Spearman correlation between visual ordering proxy and observables with Mahalanobis distance metric.
+
+```{r calculate_spearman_corr}
+mat_df <- lapply(seq_along(corr_per_day),FUN=function(x){corr_per_day[[x]][permutation_orderings[[x]],permutation_orderings[[x]]]})
+mat_df <- lapply(seq_along(mat_df),FUN=function(x){as.vector(mat_df[[x]][upper.tri(mat_df[[x]])])})
+permutation_df <- do.call(rbind, mat_df)
+permutation_df <- scale(permutation_df)
+distm <- dist(permutation_df, method = 'euclidean')
+distm <- as.matrix(distm)
+all_row_idx <- rep(NA, nrow(distm)^2)
+all_col_idx <- rep(NA, nrow(distm)^2)
+all_dists <- rep(NA, nrow(distm)^2)
+count <- 0
+for (row_idx in seq_len(nrow(distm))) {
+  for (column_idx in seq_len(nrow(distm))){
+    count <- count +1
+    all_row_idx[count] <- row_idx
+    all_col_idx[count] <- column_idx
+    all_dists[count] <- distm[row_idx,column_idx]
+  }
+}
+pair_dist_perm <- data.frame(row_idx=all_row_idx,col_idx = all_col_idx, dist=all_dists)
+pair_dist_perm <- pair_dist_perm %>%  filter(row_idx <col_idx) %>% mutate(row_date = dt_list[row_idx], col_date = dt_list[col_idx]) 
+pair_dist_perm <- pair_dist_perm %>% mutate(pair_idx=1:nrow(pair_dist_perm)) %>% arrange(dist)
+pair_dist_perm_enh <- pair_dist_perm %>% inner_join(pair_dist_df,by = c("row_date","col_date"))
+```
+
+
+```{r run_spearman_hyp_test}
+spear_correl <- cor(pair_dist_perm_enh$dist.x,pair_dist_perm_enh$dist.y,method = "spearman")
+print(round(spear_correl,1))
+
+cor.test(pair_dist_perm_enh$dist.x,pair_dist_perm_enh$dist.y,method = "spearman",exact = T,alternative = "greater")
+```

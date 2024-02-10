@@ -2,6 +2,6 @@
 
 ## Code and data
 
-* Code related to the application sections are contained in statistical_observable_analysis.Rmd, this is an R Markdown file, and can be knitted into a html or pdf output document. To run this file, install R (  https://cran.r-project.org/) and prerequisite packages as specified in the files.
+* Code related to the statistical analysis of the observables, along with anomaly detection and visual similarity is contained in statistical_observable_analysis.Rmd. This is an R markdown file, and can be knitted into a html or pdf output document. To run this file, install R (https://cran.r-project.org/) and all prerequisite packages as specified in the R markdown file. Associated data is contained in the data folder.
 
 
